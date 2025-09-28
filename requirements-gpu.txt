@@ -1,0 +1,9 @@
+# GPU/编译型依赖（有卡再装）
+spatial-correlation-sampler==0.4.0
+
+# torch 系列不要写死旧版本，用官方 wheel
+# CUDA 12.1 (推荐新卡/A100/3090等):
+torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# 如果是旧卡/驱动只能跑 CUDA 11.8，就用下面这一行：
+# torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
