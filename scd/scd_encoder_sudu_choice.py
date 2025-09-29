@@ -59,24 +59,24 @@ class Encoder(nn.Module):
         self.t_encoder = TransformerEncoder(encoder_layer, num_layer)
         self.s_encoder = TransformerEncoder(encoder_layer, num_layer)
 
-        # ===== 物理先验：配置与强度（默认关闭） =====
+        # ===== 写死为默认开启；仍支持被 builder 覆盖 =====
         self.phys_cfg = dict(
-            use_kin_residual=False,
-            use_phys_bias=False,     # 占位：未修改 logits
-            use_kv_gate=False,
-            phys_use_acc=False,
+            use_kin_residual=True,
+            use_phys_bias=False,   # 占位：未改 logits
+            use_kv_gate=True,
+            phys_use_acc=True,
             phys_mix_a=0.3,
             attn_bias_rownorm=False
         )
         self.phys_strength = dict(
-            beta_s=0.0, beta_t=0.0,
-            lambda_phys=0.0,         # 占位：未修改 logits
-            alpha_gate=0.0, gamma_gate=0.0
+            beta_s=0.30, beta_t=0.30,
+            lambda_phys=0.0,
+            alpha_gate=0.25, gamma_gate=0.25
         )
-        # ★ 新增：本 encoder 是否应用 残差/门控（由 builder 按 Q/K 分支设置）
+        # 哪个分支应用（默认都应用；builder 会按 Q/K 改写）
         self.phys_apply = dict(residual=True, gate=True)
 
-        # 动力学残差投影头
+        # 残差投影头
         dks, dkt = 10, 6
         self.kin_proj_s = nn.Sequential(
             nn.Linear(dks, self.d_model),
@@ -87,7 +87,7 @@ class Encoder(nn.Module):
             nn.LayerNorm(self.d_model)
         )
 
-    # ===== 外部 setter =====
+    # 仍保留这些 setter，便于 builder 写死后下发
     def set_phys_cfg(self, cfg: dict):
         self.phys_cfg.update(cfg)
 
@@ -95,10 +95,10 @@ class Encoder(nn.Module):
                           lambda_phys: float, alpha_gate: float, gamma_gate: float):
         self.phys_strength.update(dict(
             beta_s=beta_s, beta_t=beta_t,
-            lambda_phys=lambda_phys, alpha_gate=alpha_gate, gamma_gate=gamma_gate
+            lambda_phys=lambda_phys,
+            alpha_gate=alpha_gate, gamma_gate=gamma_gate
         ))
 
-    # ★ 新增：仅在本 encoder 应用哪些机制（让你“只测 Q 或 K”）
     def set_phys_apply(self, residual: bool = None, gate: bool = None):
         if residual is not None:
             self.phys_apply['residual'] = bool(residual)
@@ -179,16 +179,12 @@ class Encoder(nn.Module):
         vs = rearrange(vs, '(B M) C T V -> B (M V) (T C)', M=2)
         vs = self.channel_s(vs)    # (B, M*V, d_model)
 
-        # 物理先验：残差 + 门控（按侧选择）
-        use_res_cfg = self.phys_cfg.get('use_kin_residual', False)
-        use_gate_cfg = self.phys_cfg.get('use_kv_gate', False)
+        # 物理先验：残差 + 门控（按侧生效）
+        use_res = self.phys_cfg.get('use_kin_residual', False) and self.phys_apply.get('residual', True)
+        use_gate = self.phys_cfg.get('use_kv_gate', False) and self.phys_apply.get('gate', True)
         beta_s = float(self.phys_strength.get('beta_s', 0.0))
         beta_t = float(self.phys_strength.get('beta_t', 0.0))
         alpha_gate = float(self.phys_strength.get('alpha_gate', 0.0))
-
-        # 侧向开关
-        use_res = use_res_cfg and self.phys_apply.get('residual', True)
-        use_gate = use_gate_cfg and self.phys_apply.get('gate', True)
 
         if (use_res and (beta_s > 0 or beta_t > 0)) or (use_gate and alpha_gate > 0):
             with torch.no_grad():
@@ -200,12 +196,14 @@ class Encoder(nn.Module):
                 vt = vt + beta_t * self.kin_proj_t(k_t)
 
             if use_gate and alpha_gate > 0:
-                vt = vt * (1.0 + alpha_gate * s_frame)  # (B,T,1) broadcast到 C
-                vs = vs * (1.0 + alpha_gate * s_joint)  # (B,MV,1) broadcast到 C
+                vt = vt * (1.0 + alpha_gate * s_frame)  # (B,T,1) → 广播到 C
+                vs = vs * (1.0 + alpha_gate * s_joint)  # (B,MV,1) → 广播到 C
 
+        # Transformer 精炼
         vt = self.t_encoder(vt)
         vs = self.s_encoder(vs)
 
+        # 池化
         vt = vt.amax(dim=1)
         vs = vs.amax(dim=1)
 
@@ -242,37 +240,26 @@ class PretrainingEncoder(nn.Module):
             nn.Linear(self.d_model, num_class)
         )
 
-        self._phys_cfg_cached = {}
-        self._phys_strength_cached = {}
-
-    # 透传：config / strength / apply-side
+    # 透传（builder 会调用；若你不需要，也可以不调用）
     def set_phys_cfg(self, cfg: dict):
-        self._phys_cfg_cached.update(cfg)
         if hasattr(self.encoder, 'set_phys_cfg'):
             self.encoder.set_phys_cfg(cfg)
 
     def set_phys_strength(self, beta_s: float, beta_t: float,
                           lambda_phys: float, alpha_gate: float, gamma_gate: float):
-        payload = dict(beta_s=beta_s, beta_t=beta_t,
-                       lambda_phys=lambda_phys, alpha_gate=alpha_gate, gamma_gate=gamma_gate)
-        self._phys_strength_cached.update(payload)
         if hasattr(self.encoder, 'set_phys_strength'):
-            self.encoder.set_phys_strength(**payload)
+            self.encoder.set_phys_strength(beta_s, beta_t, lambda_phys, alpha_gate, gamma_gate)
 
-    # ★ 新增：由 builder 调用，控制本分支应用哪些机制
     def set_phys_apply(self, residual: bool = None, gate: bool = None):
         if hasattr(self.encoder, 'set_phys_apply'):
             self.encoder.set_phys_apply(residual=residual, gate=gate)
 
     def forward(self, x):
         vt, vs = self.encoder(x)
-
         zt = self.t_proj(vt)
         zs = self.s_proj(vs)
-
         vi = torch.cat([vt, vs], dim=1)
         zi = self.i_proj(vi)
-
         return zt, zs, zi
 
 
@@ -293,21 +280,15 @@ class DownstreamEncoder(nn.Module):
 
         self.fc = nn.Linear(2 * self.d_model, num_class)
 
-        self._phys_cfg_cached = {}
-        self._phys_strength_cached = {}
-
+    # 可选：下游也能用同样的 setter
     def set_phys_cfg(self, cfg: dict):
-        self._phys_cfg_cached.update(cfg)
         if hasattr(self.encoder, 'set_phys_cfg'):
             self.encoder.set_phys_cfg(cfg)
 
     def set_phys_strength(self, beta_s: float, beta_t: float,
                           lambda_phys: float, alpha_gate: float, gamma_gate: float):
-        payload = dict(beta_s=beta_s, beta_t=beta_t,
-                       lambda_phys=lambda_phys, alpha_gate=alpha_gate, gamma_gate=gamma_gate)
-        self._phys_strength_cached.update(payload)
         if hasattr(self.encoder, 'set_phys_strength'):
-            self.encoder.set_phys_strength(**payload)
+            self.encoder.set_phys_strength(beta_s, beta_t, lambda_phys, alpha_gate, gamma_gate)
 
     def set_phys_apply(self, residual: bool = None, gate: bool = None):
         if hasattr(self.encoder, 'set_phys_apply'):
