@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from .scd_encoder import PretrainingEncoder
+from .scd_encoder_sudu_choice import PretrainingEncoder
 
 
 # initilize weight
