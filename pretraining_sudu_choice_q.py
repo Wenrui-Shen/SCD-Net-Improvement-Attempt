@@ -12,7 +12,7 @@ import torch.backends.cudnn as cudnn
 import torch.optim
 import torch.utils.data
 
-import scd.builder_sudu_choice
+import scd.builder_sudu_choice_q
 from torch.utils.tensorboard import SummaryWriter
 from dataset import get_pretraining_set
 
